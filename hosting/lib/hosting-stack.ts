@@ -74,9 +74,10 @@ export class HostingStack extends cdk.Stack {
       },
     });
 
-    // Create SSL certificate for custom domain
+    // Create SSL certificate for custom domains (both prod and dev)
     const certificate = new Certificate(this, 'domain-certificate', {
       domainName: 'oauth.cals-api.com',
+      subjectAlternativeNames: ['dev.oauth.cals-api.com'],
       validation: CertificateValidation.fromDns(),
     });
 
@@ -107,7 +108,7 @@ export class HostingStack extends cdk.Stack {
           ttl: cdk.Duration.minutes(5),
         },
       ],
-      domainNames: ['oauth.cals-api.com'],
+      domainNames: ['oauth.cals-api.com', 'dev.oauth.cals-api.com'],
       certificate: certificate,
       priceClass: PriceClass.PRICE_CLASS_100, // US, Canada, Europe only
     });

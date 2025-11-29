@@ -6,11 +6,34 @@
 // Configuration
 const COGNITO_CONFIG = {
   region: 'us-east-1',
-  userPoolId: 'us-east-1_c0hPAs0Us',
-  clientId: '37u4esg6blk7sdbqvjhlbjh3hk',
-  domain: 'https://auth.cals-api.com',
-  redirectUri: 'https://oauth.cals-api.com/auth/callback', // Production
-  // redirectUri: 'http://localhost:8080/auth/callback', // Local dev
+  devUserPoolId: 'us-east-1_c0hPAs0Us',
+  prodUserPoolId: 'us-east-1_QA3w6mkCV',
+  devClientId: '37u4esg6blk7sdbqvjhlbjh3hk',
+  prodClientId: '7l7un286e3nm1r1jb2ubuu7nim',
+  devDomain: 'https://auth.dev.marketplace.csm.codes',
+  prodDomain: 'https://auth.marketplace.csm.codes',
+}
+
+// Determine environment based on current hostname
+function getEnvironment(): 'dev' | 'prod' {
+  const hostname = window.location.hostname
+  return hostname.includes('dev.oauth') ? 'dev' : 'prod'
+}
+
+// Get environment-specific config values
+function getClientId(): string {
+  return getEnvironment() === 'dev' ? COGNITO_CONFIG.devClientId : COGNITO_CONFIG.prodClientId
+}
+
+function getCognitoDomain(): string {
+  return getEnvironment() === 'dev' ? COGNITO_CONFIG.devDomain : COGNITO_CONFIG.prodDomain
+}
+
+function getRedirectUri(): string {
+  const env = getEnvironment()
+  return env === 'dev'
+    ? 'https://dev.oauth.cals-api.com/auth/callback'
+    : 'https://oauth.cals-api.com/auth/callback'
 }
 
 // Allowed domains for return URLs (security whitelist)
@@ -154,8 +177,8 @@ async function buildAuthUrl(provider: 'google' | 'apple'): Promise<string> {
 
   const params = new URLSearchParams({
     response_type: 'code',
-    client_id: COGNITO_CONFIG.clientId,
-    redirect_uri: COGNITO_CONFIG.redirectUri,
+    client_id: getClientId(),
+    redirect_uri: getRedirectUri(),
     identity_provider: identityProvider,
     scope: 'openid email profile',
     state: state,
@@ -168,7 +191,7 @@ async function buildAuthUrl(provider: 'google' | 'apple'): Promise<string> {
     params.append('prompt', 'select_account')
   }
 
-  return `${COGNITO_CONFIG.domain}/oauth2/authorize?${params.toString()}`
+  return `${getCognitoDomain()}/oauth2/authorize?${params.toString()}`
 }
 
 // UI Helper functions
@@ -270,22 +293,69 @@ async function handleOAuthFlow(): Promise<void> {
       return
     }
 
-    // Clean up
-    localStorage.removeItem('oauth_intent')
-    sessionStorage.removeItem('pkce_code_verifier')
+    // Get PKCE code verifier
+    const codeVerifier = sessionStorage.getItem('pkce_code_verifier')
+    if (!codeVerifier) {
+      showError('Session error', 'PKCE verification failed. Please try again.')
+      localStorage.removeItem('oauth_intent')
+      return
+    }
 
-    // Build return URL with all OAuth parameters
-    const returnUrl = new URL(intent.returnUrl)
-    params.forEach((value, key) => {
-      returnUrl.searchParams.set(key, value)
-    })
+    // Exchange authorization code for tokens
+    try {
+      const tokenParams = new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: getClientId(),
+        code: code,
+        redirect_uri: getRedirectUri(),
+        code_verifier: codeVerifier,
+      })
 
-    console.log('Redirecting to:', returnUrl.toString())
+      const tokenResponse = await fetch(`${getCognitoDomain()}/oauth2/token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: tokenParams.toString(),
+      })
 
-    // Redirect to original destination with OAuth params
-    setTimeout(() => {
-      window.location.href = returnUrl.toString()
-    }, 500)
+      if (!tokenResponse.ok) {
+        const errorData = await tokenResponse.json().catch(() => ({}))
+        throw new Error(errorData.error_description || 'Token exchange failed')
+      }
+
+      const tokens = await tokenResponse.json()
+
+      // Clean up
+      localStorage.removeItem('oauth_intent')
+      sessionStorage.removeItem('pkce_code_verifier')
+
+      // Build return URL with tokens instead of code
+      const returnUrl = new URL(intent.returnUrl)
+      returnUrl.searchParams.set('access_token', tokens.access_token)
+      returnUrl.searchParams.set('id_token', tokens.id_token)
+      returnUrl.searchParams.set('refresh_token', tokens.refresh_token)
+      returnUrl.searchParams.set('token_type', tokens.token_type || 'Bearer')
+      if (tokens.expires_in) {
+        returnUrl.searchParams.set('expires_in', tokens.expires_in.toString())
+      }
+
+      console.log('Redirecting to:', returnUrl.toString())
+
+      // Redirect to original destination with tokens
+      setTimeout(() => {
+        window.location.href = returnUrl.toString()
+      }, 500)
+    } catch (error) {
+      console.error('Token exchange failed:', error)
+      showError(
+        'Authentication failed',
+        error instanceof Error ? error.message : 'Failed to exchange authorization code for tokens'
+      )
+      // Clean up on error
+      localStorage.removeItem('oauth_intent')
+      sessionStorage.removeItem('pkce_code_verifier')
+    }
     return
   }
 
