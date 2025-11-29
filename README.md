@@ -1,0 +1,1 @@
+This is an SPA to handle oauth flows over multiple domains without having to redeploy a whole CDK stack every time i want to add a new authed subdomain or new domain.

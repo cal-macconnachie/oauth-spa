@@ -1,0 +1,25 @@
+{
+  "name": "oauth-spa",
+  "version": "1.0.0",
+  "description": "OAuth redirect service for multiple domains",
+  "type": "module",
+  "private": true,
+  "workspaces": [
+    "hosting"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "cdk": "yarn workspace hosting cdk",
+    "cdk:deploy": "yarn workspace hosting cdk deploy",
+    "cdk:synth": "yarn workspace hosting cdk synth",
+    "cdk:diff": "yarn workspace hosting cdk diff",
+    "cdk:destroy": "yarn workspace hosting cdk destroy"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "vite": "^5.0.0"
+  },
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+}
