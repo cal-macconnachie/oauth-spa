@@ -248,6 +248,10 @@ function showError(message: string, details?: string): void {
 // Main OAuth flow handler
 async function handleOAuthFlow(): Promise<void> {
   const params = new URLSearchParams(window.location.search)
+  const localStorageTheme = localStorage.getItem('oauth_theme')
+  if (localStorageTheme === 'dark' || localStorageTheme === 'light') {
+    document.body.dataset.theme = localStorageTheme
+  }
 
   // CASE 1: Incoming request with return_url and provider
   if (params.has('return_url') && params.has('provider')) {
@@ -256,6 +260,7 @@ async function handleOAuthFlow(): Promise<void> {
     const theme = params.get('theme')?.toLowerCase()
     if (theme) {
       document.body.dataset.theme = theme === 'dark' ? 'dark' : 'light'
+      localStorage.setItem('oauth_theme', theme === 'dark' ? 'dark' : 'light')
     }
 
     if (provider !== 'google' && provider !== 'apple') {
