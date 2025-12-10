@@ -53,6 +53,12 @@ interface OAuthIntent {
   theme?: 'light' | 'dark'
 }
 
+// Logout intent stored in localStorage
+interface LogoutIntent {
+  returnUrl: string
+  timestamp: number
+}
+
 // PKCE helpers
 function generateRandomString(length: number): string {
   const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
@@ -169,6 +175,48 @@ function getOAuthIntent(): OAuthIntent | null {
   }
 }
 
+// Store logout intent before showing logout confirmation
+function storeLogoutIntent(returnUrl: string): void {
+  if (!validateReturnUrl(returnUrl)) {
+    throw new Error('Invalid return URL. Domain not in allowed list.')
+  }
+
+  const intent: LogoutIntent = {
+    returnUrl,
+    timestamp: Date.now(),
+  }
+
+  try {
+    localStorage.setItem('logout_intent', JSON.stringify(intent))
+    console.log('Stored logout intent:', intent)
+  } catch (e) {
+    throw new Error('Failed to store logout intent. localStorage may be disabled.')
+  }
+}
+
+// Retrieve and validate logout intent
+function getLogoutIntent(): LogoutIntent | null {
+  const stored = localStorage.getItem('logout_intent')
+  if (!stored) return null
+
+  try {
+    const data: LogoutIntent = JSON.parse(stored)
+    const age = Date.now() - data.timestamp
+
+    // Expire after 10 minutes
+    if (age > 10 * 60 * 1000) {
+      console.warn('Logout intent expired')
+      localStorage.removeItem('logout_intent')
+      return null
+    }
+
+    return data
+  } catch {
+    localStorage.removeItem('logout_intent')
+    return null
+  }
+}
+
 // Build OAuth authorization URL
 async function buildAuthUrl(provider: 'google' | 'apple'): Promise<string> {
   const { codeChallenge } = await setupPKCE()
@@ -245,12 +293,56 @@ function showError(message: string, details?: string): void {
   `
 }
 
+function showLogoutComplete(returnUrl: string): void {
+  const content = document.getElementById('content')
+  if (!content) return
+
+  content.innerHTML = `
+    <div class="status-container">
+      <div class="success-icon">✓</div>
+      <h2>Logged Out Successfully</h2>
+      <p>You have been logged out. Redirecting you back...</p>
+      <p class="redirect-note">You will be redirected in a moment.</p>
+    </div>
+  `
+
+  // Redirect after a brief delay
+  setTimeout(() => {
+    window.location.href = returnUrl
+  }, 1500)
+}
+
 // Main OAuth flow handler
 async function handleOAuthFlow(): Promise<void> {
   const params = new URLSearchParams(window.location.search)
   const localStorageTheme = localStorage.getItem('oauth_theme')
   if (localStorageTheme === 'dark' || localStorageTheme === 'light') {
     document.body.dataset.theme = localStorageTheme
+  }
+
+  // CASE 0: Logout flow
+  if (params.has('logout') && params.get('logout') === 'true') {
+    const returnUrl = params.get('return_url')
+
+    if (!returnUrl) {
+      showError('Missing return URL', 'A return_url parameter is required for logout.')
+      return
+    }
+
+    try {
+      // Validate and store logout intent
+      storeLogoutIntent(returnUrl)
+
+      // Show logout completion message and redirect
+      showLogoutComplete(returnUrl)
+    } catch (error) {
+      console.error('Failed to process logout:', error)
+      showError(
+        'Logout failed',
+        error instanceof Error ? error.message : 'Unknown error'
+      )
+    }
+    return
   }
 
   // CASE 1: Incoming request with return_url and provider
