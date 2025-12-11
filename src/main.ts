@@ -320,7 +320,37 @@ async function handleOAuthFlow(): Promise<void> {
     document.body.dataset.theme = localStorageTheme
   }
 
-  // CASE 0: Logout flow
+  // CASE 0: Logout flow (from Cognito state parameter)
+  // Cognito passes logout info via state parameter after logout
+  const stateParam = params.get('state')
+  if (stateParam) {
+    try {
+      const state = JSON.parse(stateParam)
+
+      // Check if this is a logout flow
+      if (state.logout === true && state.return_url) {
+        const returnUrl = state.return_url
+
+        // Validate return URL
+        if (!validateReturnUrl(returnUrl)) {
+          showError('Invalid return URL', 'The return URL domain is not in the allowed list.')
+          return
+        }
+
+        // Store logout intent
+        storeLogoutIntent(returnUrl)
+
+        // Show logout completion message and redirect
+        showLogoutComplete(returnUrl)
+        return
+      }
+    } catch (error) {
+      // If state parsing fails, it's not a logout flow - continue to other cases
+      console.log('State parameter is not a logout flow:', error)
+    }
+  }
+
+  // CASE 0b: Legacy logout flow with query parameters (for backwards compatibility)
   if (params.has('logout') && params.get('logout') === 'true') {
     const returnUrl = params.get('return_url')
 
