@@ -14,6 +14,10 @@ const COGNITO_CONFIG = {
   prodDomain: 'https://auth.marketplace.csm.codes',
 }
 
+const INTENT_EXPIRY_MS = 10 * 60 * 1000 // 10 minutes
+const TOKEN_EXCHANGE_TIMEOUT_MS = 15_000
+const SLOW_EXCHANGE_NOTICE_MS = 4_000
+
 // Determine environment based on current hostname
 function getEnvironment(): 'dev' | 'prod' {
   const hostname = window.location.hostname
@@ -45,7 +49,7 @@ const ALLOWED_DOMAINS = [
   'localhost:*',
 ]
 
-// OAuth intent stored in localStorage
+// OAuth intent stored in localStorage (keyed by flow ID for multi-tab safety)
 interface OAuthIntent {
   returnUrl: string
   provider: 'google' | 'apple'
@@ -57,6 +61,22 @@ interface OAuthIntent {
 interface LogoutIntent {
   returnUrl: string
   timestamp: number
+}
+
+// HTML-escape to prevent XSS in innerHTML
+function escapeHtml(str: string): string {
+  const div = document.createElement('div')
+  div.textContent = str
+  return div.innerHTML
+}
+
+// Extract display domain from a URL for user context
+function extractDomain(url: string): string {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return ''
+  }
 }
 
 // PKCE helpers
@@ -89,11 +109,37 @@ async function setupPKCE(): Promise<{ codeVerifier: string; codeChallenge: strin
   return { codeVerifier, codeChallenge }
 }
 
-// State parameter for CSRF protection
-function generateState(): string {
-  const state = generateRandomString(32)
-  sessionStorage.setItem('oauth_state', state)
-  return state
+// Generate a unique flow ID for multi-tab safety
+function generateFlowId(): string {
+  return generateRandomString(16)
+}
+
+// State parameter for CSRF protection — encodes flow ID alongside random token
+function generateState(flowId: string): string {
+  const token = generateRandomString(32)
+  const statePayload = JSON.stringify({ token, flowId })
+  sessionStorage.setItem('oauth_state', statePayload)
+  return statePayload
+}
+
+// Parse and validate state returned from Cognito
+function validateAndConsumeState(stateParam: string): { flowId: string } | null {
+  const storedRaw = sessionStorage.getItem('oauth_state')
+  if (!storedRaw || !stateParam) return null
+
+  try {
+    const stored = JSON.parse(storedRaw)
+    const incoming = JSON.parse(stateParam)
+
+    if (stored.token && incoming.token && stored.token === incoming.token) {
+      // Only clear state after successful validation
+      sessionStorage.removeItem('oauth_state')
+      return { flowId: incoming.flowId }
+    }
+  } catch {
+    // Not a valid state JSON — not our flow
+  }
+  return null
 }
 
 // Match a hostname/host against a domain pattern with wildcards
@@ -132,8 +178,8 @@ function validateReturnUrl(url: string): boolean {
   }
 }
 
-// Store OAuth intent before redirecting to provider
-function storeOAuthIntent(returnUrl: string, provider: 'google' | 'apple'): void {
+// Store OAuth intent keyed by flow ID (multi-tab safe)
+function storeOAuthIntent(flowId: string, returnUrl: string, provider: 'google' | 'apple'): void {
   if (!validateReturnUrl(returnUrl)) {
     throw new Error('Invalid return URL. Domain not in allowed list.')
   }
@@ -145,33 +191,52 @@ function storeOAuthIntent(returnUrl: string, provider: 'google' | 'apple'): void
   }
 
   try {
-    localStorage.setItem('oauth_intent', JSON.stringify(intent))
-    console.log('Stored OAuth intent:', intent)
-  } catch (e) {
+    localStorage.setItem(`oauth_intent_${flowId}`, JSON.stringify(intent))
+  } catch {
     throw new Error('Failed to store OAuth intent. localStorage may be disabled.')
   }
 }
 
-// Retrieve and validate OAuth intent
-function getOAuthIntent(): OAuthIntent | null {
-  const stored = localStorage.getItem('oauth_intent')
+// Retrieve and validate OAuth intent by flow ID
+function getOAuthIntent(flowId: string): OAuthIntent | null {
+  const key = `oauth_intent_${flowId}`
+  const stored = localStorage.getItem(key)
   if (!stored) return null
 
   try {
     const data: OAuthIntent = JSON.parse(stored)
     const age = Date.now() - data.timestamp
 
-    // Expire after 10 minutes
-    if (age > 10 * 60 * 1000) {
-      console.warn('OAuth intent expired')
-      localStorage.removeItem('oauth_intent')
+    if (age > INTENT_EXPIRY_MS) {
+      localStorage.removeItem(key)
       return null
     }
 
     return data
   } catch {
-    localStorage.removeItem('oauth_intent')
+    localStorage.removeItem(key)
     return null
+  }
+}
+
+// Clean up an OAuth intent by flow ID
+function removeOAuthIntent(flowId: string): void {
+  localStorage.removeItem(`oauth_intent_${flowId}`)
+}
+
+// Clean up any expired intents (garbage collection)
+function cleanupExpiredIntents(): void {
+  for (let i = localStorage.length - 1; i >= 0; i--) {
+    const key = localStorage.key(i)
+    if (!key?.startsWith('oauth_intent_')) continue
+    try {
+      const data = JSON.parse(localStorage.getItem(key)!)
+      if (Date.now() - data.timestamp > INTENT_EXPIRY_MS) {
+        localStorage.removeItem(key)
+      }
+    } catch {
+      localStorage.removeItem(key!)
+    }
   }
 }
 
@@ -188,8 +253,7 @@ function storeLogoutIntent(returnUrl: string): void {
 
   try {
     localStorage.setItem('logout_intent', JSON.stringify(intent))
-    console.log('Stored logout intent:', intent)
-  } catch (e) {
+  } catch {
     throw new Error('Failed to store logout intent. localStorage may be disabled.')
   }
 }
@@ -203,9 +267,7 @@ function getLogoutIntent(): LogoutIntent | null {
     const data: LogoutIntent = JSON.parse(stored)
     const age = Date.now() - data.timestamp
 
-    // Expire after 10 minutes
-    if (age > 10 * 60 * 1000) {
-      console.warn('Logout intent expired')
+    if (age > INTENT_EXPIRY_MS) {
       localStorage.removeItem('logout_intent')
       return null
     }
@@ -218,9 +280,9 @@ function getLogoutIntent(): LogoutIntent | null {
 }
 
 // Build OAuth authorization URL
-async function buildAuthUrl(provider: 'google' | 'apple'): Promise<string> {
+async function buildAuthUrl(provider: 'google' | 'apple', flowId: string): Promise<string> {
   const { codeChallenge } = await setupPKCE()
-  const state = generateState()
+  const state = generateState(flowId)
 
   const identityProvider = provider === 'google' ? 'Google' : 'SignInWithApple'
 
@@ -261,7 +323,7 @@ const PROVIDER_ICONS = {
 }
 
 // UI Helper functions
-function showLoading(message: string, icon?: string): void {
+function showLoading(icon?: string, contextDomain?: string): void {
   const content = document.getElementById('content')
   if (!content) return
 
@@ -269,26 +331,39 @@ function showLoading(message: string, icon?: string): void {
     <div class="status-container">
       ${
         icon
-          ? `<div class="provider-icon" style="display: flex; justify-content: center; align-items: center;">${icon}</div>`
+          ? `<div class="provider-icon">${icon}</div>`
           : '<div class="spinner"></div>'
       }
+      ${contextDomain ? `<p class="context-domain">Signing in to return to <strong>${escapeHtml(contextDomain)}</strong></p>` : ''}
     </div>
   `
 }
 
-function showError(message: string, details?: string): void {
+function showError(message: string, options?: { details?: string; retryUrl?: string; returnUrl?: string }): void {
   const content = document.getElementById('content')
   if (!content) return
 
+  const safeMessage = escapeHtml(message)
+  const safeDetails = options?.details ? escapeHtml(options.details) : ''
+
+  const buttons: string[] = []
+  if (options?.retryUrl) {
+    buttons.push(`<button onclick="window.location.href='${escapeHtml(options.retryUrl)}'" class="btn">Try Again</button>`)
+  }
+  if (options?.returnUrl) {
+    buttons.push(`<button onclick="window.location.href='${escapeHtml(options.returnUrl)}'" class="btn${options?.retryUrl ? ' btn--secondary' : ''}">Return to App</button>`)
+  }
+  if (buttons.length === 0) {
+    buttons.push(`<button onclick="window.location.href='https://cals-api.com'" class="btn">Return to Home</button>`)
+  }
+
   content.innerHTML = `
     <div class="status-container error">
-      <div class="error-icon">�</div>
+      <div class="error-icon">\u26A0</div>
       <h2>Authentication Error</h2>
-      <p class="error-message">${message}</p>
-      ${details ? `<p class="error-details">${details}</p>` : ''}
-      <button onclick="window.location.href='https://cals-api.com'" class="btn">
-        Return to Home
-      </button>
+      <p class="error-message">${safeMessage}</p>
+      ${safeDetails ? `<p class="error-details">${safeDetails}</p>` : ''}
+      <div>${buttons.join('\n')}</div>
     </div>
   `
 }
@@ -299,17 +374,36 @@ function showLogoutComplete(returnUrl: string): void {
 
   content.innerHTML = `
     <div class="status-container">
-      <div class="success-icon">✓</div>
+      <div class="success-icon">\u2713</div>
       <h2>Logged Out Successfully</h2>
-      <p>You have been logged out. Redirecting you back...</p>
-      <p class="redirect-note">You will be redirected in a moment.</p>
+      <p>Redirecting you back...</p>
     </div>
   `
 
-  // Redirect after a brief delay
   setTimeout(() => {
     window.location.href = returnUrl
-  }, 1500)
+  }, 500)
+}
+
+// Show a "taking longer than expected" notice inside the existing status container
+function showSlowNotice(): void {
+  const container = document.querySelector('.status-container')
+  if (!container || container.querySelector('.slow-notice')) return
+  const notice = document.createElement('p')
+  notice.className = 'slow-notice'
+  notice.textContent = 'Taking longer than expected...'
+  container.appendChild(notice)
+}
+
+// Fetch with timeout via AbortController
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // Main OAuth flow handler
@@ -320,56 +414,48 @@ async function handleOAuthFlow(): Promise<void> {
     document.body.dataset.theme = localStorageTheme
   }
 
+  // Garbage-collect any expired intents on every page load
+  cleanupExpiredIntents()
+
   // CASE 0: Logout flow (from Cognito state parameter)
-  // Cognito passes logout info via state parameter after logout
   const stateParam = params.get('state')
-  if (stateParam) {
+  if (stateParam && !params.has('code') && !params.has('error')) {
     try {
       const state = JSON.parse(stateParam)
 
-      // Check if this is a logout flow
       if (state.logout === true && state.return_url) {
         const returnUrl = state.return_url
 
-        // Validate return URL
         if (!validateReturnUrl(returnUrl)) {
-          showError('Invalid return URL', 'The return URL domain is not in the allowed list.')
+          showError('Invalid return URL', { details: 'The return URL domain is not in the allowed list.' })
           return
         }
 
-        // Store logout intent
         storeLogoutIntent(returnUrl)
-
-        // Show logout completion message and redirect
         showLogoutComplete(returnUrl)
         return
       }
-    } catch (error) {
-      // If state parsing fails, it's not a logout flow - continue to other cases
-      console.log('State parameter is not a logout flow:', error)
+    } catch {
+      // State is not a logout JSON — fall through to other cases
     }
   }
 
-  // CASE 0b: Legacy logout flow with query parameters (for backwards compatibility)
+  // CASE 0b: Legacy logout flow with query parameters
   if (params.has('logout') && params.get('logout') === 'true') {
     const returnUrl = params.get('return_url')
 
     if (!returnUrl) {
-      showError('Missing return URL', 'A return_url parameter is required for logout.')
+      showError('Missing return URL', { details: 'A return_url parameter is required for logout.' })
       return
     }
 
     try {
-      // Validate and store logout intent
       storeLogoutIntent(returnUrl)
-
-      // Show logout completion message and redirect
       showLogoutComplete(returnUrl)
     } catch (error) {
-      console.error('Failed to process logout:', error)
       showError(
         'Logout failed',
-        error instanceof Error ? error.message : 'Unknown error'
+        { details: error instanceof Error ? error.message : 'Unknown error' }
       )
     }
     return
@@ -386,30 +472,28 @@ async function handleOAuthFlow(): Promise<void> {
     }
 
     if (provider !== 'google' && provider !== 'apple') {
-      showError('Invalid provider', 'Only "google" and "apple" are supported.')
+      showError('Invalid provider', { details: 'Only "google" and "apple" are supported.' })
       return
     }
 
     const providerIcon = PROVIDER_ICONS[provider as 'google' | 'apple']
-    showLoading(`Redirecting to ${provider === 'google' ? 'Google' : 'Apple'}...`, providerIcon)
+    const domain = extractDomain(returnUrl)
+    showLoading(providerIcon, domain)
 
     try {
-      // Validate and store intent
-      storeOAuthIntent(returnUrl, provider as 'google' | 'apple')
+      const flowId = generateFlowId()
+      storeOAuthIntent(flowId, returnUrl, provider as 'google' | 'apple')
 
-      // Build auth URL and redirect
-      const authUrl = await buildAuthUrl(provider as 'google' | 'apple')
-      console.log('Redirecting to:', authUrl)
+      const authUrl = await buildAuthUrl(provider as 'google' | 'apple', flowId)
 
       // Small delay to show the loading state
       setTimeout(() => {
         window.location.href = authUrl
       }, 500)
     } catch (error) {
-      console.error('Failed to initiate OAuth:', error)
       showError(
         'Failed to start authentication',
-        error instanceof Error ? error.message : 'Unknown error'
+        { details: error instanceof Error ? error.message : 'Unknown error' }
       )
     }
     return
@@ -418,43 +502,63 @@ async function handleOAuthFlow(): Promise<void> {
   // CASE 2: OAuth callback with code
   if (params.has('code')) {
     const code = params.get('code')!
-    const state = params.get('state')
+    const stateRaw = params.get('state')
     const error = params.get('error')
     const errorDescription = params.get('error_description')
 
     // Check for OAuth errors
     if (error) {
-      showError('OAuth provider error', errorDescription || error)
+      showError('OAuth provider error', { details: errorDescription || error })
       return
     }
 
-    // Validate state (CSRF protection)
-    const storedState = sessionStorage.getItem('oauth_state')
-    sessionStorage.removeItem('oauth_state')
+    // Validate state (CSRF protection) and extract flow ID
+    const stateResult = stateRaw ? validateAndConsumeState(stateRaw) : null
 
-    if (!state || !storedState || state !== storedState) {
-      showError('Security validation failed', 'Invalid state parameter. Please try again.')
+    if (!stateResult) {
+      // Detect back-button scenario: code in URL but no matching session state
+      const hasAnyState = sessionStorage.getItem('oauth_state')
+      if (!hasAnyState) {
+        showError('Authentication already completed', {
+          details: 'This page was likely reached by using the back button. You can close this tab.',
+        })
+      } else {
+        showError('Security validation failed', {
+          details: 'Invalid state parameter. Please try again.',
+        })
+        sessionStorage.removeItem('oauth_state')
+      }
       return
     }
 
-    // Get the stored intent
-    const intent = getOAuthIntent()
-    const providerIcon = intent ? PROVIDER_ICONS[intent.provider] : undefined
-    showLoading('Completing authentication...', providerIcon)
+    const { flowId } = stateResult
+
+    // Get the stored intent (must happen before showLoading so we can show provider icon)
+    const intent = getOAuthIntent(flowId)
     if (!intent) {
-      showError('Session expired', 'OAuth session was not found or has expired.')
+      showError('Session expired', {
+        details: 'Your login session timed out. Please return to the app and try again.',
+      })
       return
     }
+
+    const providerIcon = PROVIDER_ICONS[intent.provider]
+    const domain = extractDomain(intent.returnUrl)
+    showLoading(providerIcon, domain)
 
     // Get PKCE code verifier
     const codeVerifier = sessionStorage.getItem('pkce_code_verifier')
     if (!codeVerifier) {
-      showError('Session error', 'PKCE verification failed. Please try again.')
-      localStorage.removeItem('oauth_intent')
+      showError('Session error', {
+        details: 'PKCE verification failed. Your browser session may have been lost. Please try again.',
+        returnUrl: intent.returnUrl,
+      })
+      removeOAuthIntent(flowId)
       return
     }
 
     // Exchange authorization code for tokens
+    const slowTimer = setTimeout(showSlowNotice, SLOW_EXCHANGE_NOTICE_MS)
     try {
       const tokenParams = new URLSearchParams({
         grant_type: 'authorization_code',
@@ -464,13 +568,15 @@ async function handleOAuthFlow(): Promise<void> {
         code_verifier: codeVerifier,
       })
 
-      const tokenResponse = await fetch(`${getCognitoDomain()}/oauth2/token`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
+      const tokenResponse = await fetchWithTimeout(
+        `${getCognitoDomain()}/oauth2/token`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: tokenParams.toString(),
         },
-        body: tokenParams.toString(),
-      })
+        TOKEN_EXCHANGE_TIMEOUT_MS,
+      )
 
       if (!tokenResponse.ok) {
         const errorData = await tokenResponse.json().catch(() => ({}))
@@ -480,10 +586,10 @@ async function handleOAuthFlow(): Promise<void> {
       const tokens = await tokenResponse.json()
 
       // Clean up
-      localStorage.removeItem('oauth_intent')
+      removeOAuthIntent(flowId)
       sessionStorage.removeItem('pkce_code_verifier')
 
-      // Build return URL with tokens instead of code
+      // Build return URL with tokens
       const returnUrl = new URL(intent.returnUrl)
       returnUrl.searchParams.set('access_token', tokens.access_token)
       returnUrl.searchParams.set('id_token', tokens.id_token)
@@ -493,21 +599,32 @@ async function handleOAuthFlow(): Promise<void> {
         returnUrl.searchParams.set('expires_in', tokens.expires_in.toString())
       }
 
-      console.log('Redirecting to:', returnUrl.toString())
-
-      // Redirect to original destination with tokens
+      // Redirect to original destination with tokens (minimal delay)
       setTimeout(() => {
         window.location.href = returnUrl.toString()
-      }, 500)
+      }, 200)
     } catch (error) {
-      console.error('Token exchange failed:', error)
-      showError(
-        'Authentication failed',
-        error instanceof Error ? error.message : 'Failed to exchange authorization code for tokens'
-      )
-      // Clean up on error
-      localStorage.removeItem('oauth_intent')
+      removeOAuthIntent(flowId)
       sessionStorage.removeItem('pkce_code_verifier')
+
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        showError('Authentication timed out', {
+          details: 'The token exchange took too long. Please check your connection and try again.',
+          returnUrl: intent.returnUrl,
+        })
+      } else if (error instanceof TypeError && error.message === 'Failed to fetch') {
+        showError('Network error', {
+          details: 'Could not reach the authentication server. Please check your internet connection and try again.',
+          returnUrl: intent.returnUrl,
+        })
+      } else {
+        showError('Authentication failed', {
+          details: error instanceof Error ? error.message : 'Failed to exchange authorization code for tokens',
+          returnUrl: intent.returnUrl,
+        })
+      }
+    } finally {
+      clearTimeout(slowTimer)
     }
     return
   }
@@ -517,11 +634,25 @@ async function handleOAuthFlow(): Promise<void> {
     const error = params.get('error')!
     const errorDescription = params.get('error_description')
 
-    // Try to get return URL to redirect back with error
-    const intent = getOAuthIntent()
-    if (intent) {
-      localStorage.removeItem('oauth_intent')
-      const returnUrl = new URL(intent.returnUrl)
+    // We can't recover the flow ID from an error-only callback, so scan for recent intents
+    let recentIntent: OAuthIntent | null = null
+    let recentKey: string | null = null
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (!key?.startsWith('oauth_intent_')) continue
+      try {
+        const data: OAuthIntent = JSON.parse(localStorage.getItem(key)!)
+        if (Date.now() - data.timestamp < INTENT_EXPIRY_MS) {
+          recentIntent = data
+          recentKey = key
+          break
+        }
+      } catch { /* skip */ }
+    }
+
+    if (recentIntent && recentKey) {
+      localStorage.removeItem(recentKey)
+      const returnUrl = new URL(recentIntent.returnUrl)
       returnUrl.searchParams.set('error', error)
       if (errorDescription) {
         returnUrl.searchParams.set('error_description', errorDescription)
@@ -530,29 +661,20 @@ async function handleOAuthFlow(): Promise<void> {
       return
     }
 
-    showError('Authentication failed', errorDescription || error)
+    showError('Authentication failed', { details: errorDescription || error })
     return
   }
 
-  // CASE 4: Invalid request - show instructions
+  // CASE 4: No valid flow — user-friendly landing page
   const content = document.getElementById('content')
   if (!content) return
 
   content.innerHTML = `
     <div class="status-container">
-      <h1>OAuth Redirect Service</h1>
-      <p>This service handles OAuth authentication flows for multiple domains.</p>
-
-      <h3>Usage:</h3>
-      <p>Redirect users to:</p>
-      <code>https://oauth.cals-api.com?return_url=YOUR_URL&provider=google</code>
-      <p>or</p>
-      <code>https://oauth.cals-api.com?return_url=YOUR_URL&provider=apple</code>
-
-      <h3>Allowed Domains:</h3>
-      <ul>
-        ${ALLOWED_DOMAINS.map((d) => `<li>${d}</li>`).join('')}
-      </ul>
+      <h2>OAuth Redirect Service</h2>
+      <p>This page handles authentication for authorized applications.</p>
+      <p>If you arrived here by mistake, you can safely close this tab.</p>
+      <button onclick="window.location.href='https://cals-api.com'" class="btn">Go to Home</button>
     </div>
   `
 }
@@ -560,7 +682,8 @@ async function handleOAuthFlow(): Promise<void> {
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', () => {
   handleOAuthFlow().catch((error) => {
-    console.error('Unexpected error:', error)
-    showError('Unexpected error occurred', error instanceof Error ? error.message : 'Unknown error')
+    showError('Unexpected error occurred', {
+      details: error instanceof Error ? error.message : 'Unknown error',
+    })
   })
 })
