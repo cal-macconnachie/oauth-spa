@@ -6,38 +6,25 @@
 // Configuration
 const COGNITO_CONFIG = {
   region: 'us-east-1',
-  devUserPoolId: 'us-east-1_c0hPAs0Us',
-  prodUserPoolId: 'us-east-1_7h7xTnV4B',
-  devClientId: '37u4esg6blk7sdbqvjhlbjh3hk',
-  prodClientId: '3oadb1agsg4m9gi1t21vh0f0go',
-  devDomain: 'https://auth.dev.marketplace.csm.codes',
-  prodDomain: 'https://auth.csm.codes',
+  userPoolId: 'us-east-1_7h7xTnV4B',
+  clientId: '3oadb1agsg4m9gi1t21vh0f0go',
+  domain: 'https://auth.csm.codes',
 }
 
 const INTENT_EXPIRY_MS = 10 * 60 * 1000 // 10 minutes
 const TOKEN_EXCHANGE_TIMEOUT_MS = 15_000
 const SLOW_EXCHANGE_NOTICE_MS = 4_000
 
-// Determine environment based on current hostname
-function getEnvironment(): 'dev' | 'prod' {
-  const hostname = window.location.hostname
-  return hostname.includes('dev.oauth') ? 'dev' : 'prod'
-}
-
-// Get environment-specific config values
 function getClientId(): string {
-  return getEnvironment() === 'dev' ? COGNITO_CONFIG.devClientId : COGNITO_CONFIG.prodClientId
+  return COGNITO_CONFIG.clientId
 }
 
 function getCognitoDomain(): string {
-  return getEnvironment() === 'dev' ? COGNITO_CONFIG.devDomain : COGNITO_CONFIG.prodDomain
+  return COGNITO_CONFIG.domain
 }
 
 function getRedirectUri(): string {
-  const env = getEnvironment()
-  return env === 'dev'
-    ? 'https://dev.oauth.cals-api.com/auth/callback'
-    : 'https://oauth.cals-api.com/auth/callback'
+  return 'https://oauth.cals-api.com/auth/callback'
 }
 
 // Allowed domains for return URLs (security whitelist)
