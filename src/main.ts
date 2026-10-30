@@ -7,11 +7,11 @@
 const COGNITO_CONFIG = {
   region: 'us-east-1',
   devUserPoolId: 'us-east-1_c0hPAs0Us',
-  prodUserPoolId: 'us-east-1_QA3w6mkCV',
+  prodUserPoolId: 'us-east-1_7h7xTnV4B',
   devClientId: '37u4esg6blk7sdbqvjhlbjh3hk',
-  prodClientId: '7l7un286e3nm1r1jb2ubuu7nim',
+  prodClientId: '3oadb1agsg4m9gi1t21vh0f0go',
   devDomain: 'https://auth.dev.marketplace.csm.codes',
-  prodDomain: 'https://auth.marketplace.csm.codes',
+  prodDomain: 'https://auth.csm.codes',
 }
 
 const INTENT_EXPIRY_MS = 10 * 60 * 1000 // 10 minutes
