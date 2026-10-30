@@ -14,6 +14,8 @@ import {
 } from 'aws-cdk-lib/aws-cloudfront';
 import { S3BucketOrigin } from 'aws-cdk-lib/aws-cloudfront-origins';
 import { BlockPublicAccess, Bucket } from 'aws-cdk-lib/aws-s3';
+import { ARecord, HostedZone, RecordTarget } from 'aws-cdk-lib/aws-route53';
+import { CloudFrontTarget } from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
 
 export class HostingStack extends cdk.Stack {
@@ -22,7 +24,7 @@ export class HostingStack extends cdk.Stack {
 
     // S3 bucket for hosting the OAuth SPA
     const bucket = new Bucket(this, 'oauth-spa-bucket', {
-      bucketName: 'oauth-spa-cals',
+      bucketName: `oauth-spa-cals-${this.account}`,
       versioned: true,
       blockPublicAccess: BlockPublicAccess.BLOCK_ALL, // Keep bucket private
       websiteIndexDocument: 'index.html',
@@ -75,10 +77,16 @@ export class HostingStack extends cdk.Stack {
     });
 
     // Create SSL certificate for custom domains (both prod and dev)
+    const hostedZone = HostedZone.fromLookup(this, 'cals-api-zone', { domainName: 'cals-api.com' });
+
+    // oauth-staging is the temporary name the new distribution is created with; the real names are
+    // then moved onto it with `aws cloudfront associate-alias`, since one name can't be on two
+    // distributions. Deploy with `-c staging=true` until that move is done.
+    const staging = this.node.tryGetContext('staging') === 'true';
     const certificate = new Certificate(this, 'domain-certificate', {
       domainName: 'oauth.cals-api.com',
-      subjectAlternativeNames: ['dev.oauth.cals-api.com'],
-      validation: CertificateValidation.fromDns(),
+      subjectAlternativeNames: ['dev.oauth.cals-api.com', 'oauth-staging.cals-api.com'],
+      validation: CertificateValidation.fromDns(hostedZone),
     });
 
     // Create CloudFront distribution
@@ -108,9 +116,17 @@ export class HostingStack extends cdk.Stack {
           ttl: cdk.Duration.minutes(5),
         },
       ],
-      domainNames: ['oauth.cals-api.com', 'dev.oauth.cals-api.com'],
+      domainNames: staging
+        ? ['oauth-staging.cals-api.com']
+        : ['oauth.cals-api.com', 'dev.oauth.cals-api.com', 'oauth-staging.cals-api.com'],
       certificate: certificate,
       priceClass: PriceClass.PRICE_CLASS_100, // US, Canada, Europe only
+    });
+
+    new ARecord(this, 'oauth-staging-record', {
+      zone: hostedZone,
+      recordName: 'oauth-staging',
+      target: RecordTarget.fromAlias(new CloudFrontTarget(distribution)),
     });
 
     // Export bucket name and distribution ID for CI/CD
